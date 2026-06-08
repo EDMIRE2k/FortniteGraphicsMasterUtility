@@ -4,7 +4,8 @@ A native Windows 11 utility for safely managing Fortnite's hidden graphics setti
 
 The app uses Windows Mica, supports light and dark themes, creates automatic backups, and provides presets plus individual quality controls ranging from Low to Cinematic.
 
-![Fortnite Graphics Master Utility](Screenshots/app-preview.png)
+<img width="1505" height="964" alt="image" src="https://github.com/user-attachments/assets/29a461ed-f7e8-454a-bfd3-4a5412796939" />
+
 
 ## Features
 
@@ -46,61 +47,6 @@ sg.GlobalIlluminationQuality=3
 ```
 
 It is intended for devices where Epic removed the Lumen option because the hardware does not support hardware ray tracing. Performance or visual issues may still occur.
-
-## Installation
-
-Download and run the installer:
-
-[FortniteGraphicsMasterUtility-Setup.exe](Releases/FortniteGraphicsMasterUtility-Setup.exe)
-
-A standalone executable is also available:
-
-[FortniteGraphicsMasterUtility.exe](Releases/FortniteGraphicsMasterUtility.exe)
-
-## Usage
-
-1. Close Fortnite.
-2. Launch Fortnite Graphics Master Utility.
-3. Choose a preset or configure individual quality settings.
-4. Keep read-only protection enabled if you want to prevent Fortnite from resetting the values.
-5. Click **Apply settings**.
-
-Use **Restore backup** to undo the latest change.
-
-## GPU Warning
-
-Cinematic and Photography values have immense GPU requirements. DLSS, TSR, XeSS, or another upscaler is recommended unless the system has at least an RTX 4090 or RTX 5090.
-
-## Building
-
-Requirements:
-
-- Windows 11
-- .NET 10 SDK
-- Inno Setup 6
-
-Build the standalone executable and installer:
-
-```powershell
-.\build-release.ps1
-```
-
-Generated files:
-
-- `publish/FortniteGraphicsMasterUtility.exe`
-- `release/FortniteGraphicsMasterUtility-Setup.exe`
-
-## Project Structure
-
-```text
-src/FortniteCinematicSettings/       WPF application source
-tests/FortniteCinematicSettings.Tests/ Settings service smoke tests
-installer/                           Inno Setup installer definition
-tools/                               Branding asset generation script
-Releases/                            Ready-to-distribute installer and portable app
-Screenshots/                         GitHub README preview image
-build-release.ps1                    Full build and installer pipeline
-```
 
 ## Notes
 
