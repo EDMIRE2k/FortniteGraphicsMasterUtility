@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -17,401 +16,440 @@ namespace FortniteCinematicSettings;
 public partial class MainWindow : Window
 {
     private readonly IniSettingsService _ini = new();
+    private readonly ObservableCollection<QualitySetting> _settings = new(SettingsCatalog.CreateQualitySettings());
+    private readonly HashSet<string> _edited = new();
     private readonly IReadOnlyList<PresetDefinition> _presets;
-    private readonly ICollectionView _settingsView;
+    private readonly ICollectionView _view;
+    private readonly bool _persistPreferences;
+    private readonly string _themePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FortniteGraphicsMasterUtility", "theme.txt");
+    private IReadOnlyDictionary<string, string> _baseline = new Dictionary<string, string>();
+    private IReadOnlyList<SettingChange> _plan = [];
     private string _configPath;
-    private bool _loaded;
+    private string _fingerprint = "";
+    private RenderingMode? _savedMode;
+    private bool _baselineReadOnly;
+    private bool _featuresEdited;
+    private bool _dx12Nanite;
+    private bool _dx12RayTracing;
+    private bool _ready;
+    private bool _updating;
 
-    public ObservableCollection<QualitySetting> QualitySettings { get; }
-    public IReadOnlyList<QualityOption> QualityOptions => SettingsCatalog.QualityOptions;
+    public MainWindow() : this(null) { }
 
-    public MainWindow()
+    public MainWindow(string? configPath, bool persistPreferences = true)
     {
+        _configPath = configPath ?? _ini.DefaultConfigPath;
+        _persistPreferences = persistPreferences;
         InitializeComponent();
-
-        _configPath = _ini.DefaultConfigPath;
-        QualitySettings = new ObservableCollection<QualitySetting>(SettingsCatalog.CreateQualitySettings());
-        _presets = SettingsCatalog.CreatePresets();
-        _settingsView = CollectionViewSource.GetDefaultView(QualitySettings);
-        _settingsView.Filter = FilterSetting;
-        foreach (var setting in QualitySettings)
-        {
-            setting.PropertyChanged += (_, _) => UpdatePreview();
-        }
-
-        DataContext = this;
-        SettingsList.ItemsSource = _settingsView;
+        _presets = new[] { new PresetDefinition("Custom / current", "Individual values from your configuration.", false, false, new Dictionary<string, int>()) }
+            .Concat(SettingsCatalog.CreatePresets()).ToArray();
+        _view = CollectionViewSource.GetDefaultView(_settings);
+        _view.Filter = item => item is QualitySetting setting &&
+            (setting.Name.Contains(SearchBox.Text.Trim(), StringComparison.OrdinalIgnoreCase) ||
+             setting.Key.Contains(SearchBox.Text.Trim(), StringComparison.OrdinalIgnoreCase) ||
+             setting.Description.Contains(SearchBox.Text.Trim(), StringComparison.OrdinalIgnoreCase));
+        SettingsList.ItemsSource = _view;
         PresetBox.ItemsSource = _presets;
-        PresetBox.SelectedIndex = 4;
-        ConfigPathBox.Text = _configPath;
+        foreach (var setting in _settings)
+            setting.PropertyChanged += (_, args) =>
+            {
+                if (!_ready || _updating || args.PropertyName != nameof(QualitySetting.Value)) return;
+                _edited.Add(setting.Key);
+                PresetBox.SelectedIndex = 0;
+                UpdatePlan();
+            };
 
-        Loaded += MainWindow_Loaded;
+        if (_persistPreferences)
+        {
+            try { if (File.Exists(_themePath) && int.TryParse(File.ReadAllText(_themePath), out int theme)) ThemeBox.SelectedIndex = Math.Clamp(theme, 0, 2); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        var work = SystemParameters.WorkArea;
+        MinWidth = Math.Min(MinWidth, work.Width);
+        MinHeight = Math.Min(MinHeight, work.Height);
+        Width = Math.Min(Width, work.Width);
+        Height = Math.Min(Height, work.Height);
+        _ready = true;
         SourceInitialized += (_, _) =>
         {
             MicaService.Attach(this, ApplyTheme);
             ApplyTheme();
         };
-        _loaded = true;
-
-        ApplyPreset((PresetDefinition)PresetBox.SelectedItem);
-        RefreshState("Ready.");
-    }
-
-    private void MainWindow_Loaded(object sender, RoutedEventArgs e)
-    {
+        SizeChanged += (_, _) => NavigationColumn.Width = new GridLength(ActualWidth < 1000 ? 196 : 226);
+        Closing += OnClosing;
         ApplyTheme();
-        LoadCurrentValuesIntoControls();
-        RefreshState("Ready.");
+        LoadFile();
     }
 
-    private void ApplyButton_Click(object sender, RoutedEventArgs e)
+    private RenderingMode? SelectedMode => PerformanceChoice.IsChecked == true ? RenderingMode.Performance :
+        Dx12Choice.IsChecked == true ? RenderingMode.DirectX12 : null;
+    private bool IsLumen => LumenFixCheck.IsChecked == true;
+    private bool ProtectionChangedOnDisk => File.Exists(_configPath) && (ReadOnlyCheck.IsChecked == true) != _baselineReadOnly;
+    private bool HasChanges => _plan.Count > 0 || ProtectionChangedOnDisk;
+
+    private void LoadFile()
     {
-        if (!File.Exists(_configPath))
-        {
-            ShowError("GameUserSettings.ini was not found. Launch Fortnite once, or choose the file manually.");
-            return;
-        }
-
-        if (_ini.IsFortniteRunning() && !Confirm("Fortnite appears to be running. Close it first so the game does not overwrite the file when it exits.\n\nApply anyway?", "Fortnite is running"))
-        {
-            return;
-        }
-
         try
         {
-            string result;
-            if (LumenFixCheck.IsChecked == true)
+            _updating = true;
+            _baseline = _ini.ReadValues(_configPath);
+            _fingerprint = _ini.Fingerprint(_configPath);
+            _savedMode = _ini.ReadRenderingMode(_configPath);
+            _baselineReadOnly = _ini.IsReadOnly(_configPath);
+            foreach (var setting in _settings)
             {
-                if (!Confirm("Lumen Fix ignores presets and only writes ray tracing plus Lumen/global illumination keys at value 3.\n\nIt is intended for systems where Epic removed the Lumen option because hardware ray tracing is unsupported. Performance or visual issues may still occur.\n\nApply Lumen Fix?", "Lumen Fix"))
-                {
-                    return;
-                }
-
-                result = _ini.ApplyLumenFix(_configPath, ReadOnlyCheck.IsChecked == true);
+                if (_baseline.TryGetValue(IniSettingsService.Address(setting.Section, setting.Key), out var raw) && int.TryParse(raw, out int value))
+                    setting.Value = value;
+                else setting.Value = 3;
             }
-            else
-            {
-                var preset = PresetBox.SelectedItem as PresetDefinition;
-                if (preset?.RequiresWarning == true &&
-                    !Confirm("Photography maxes every exposed quality value to 5. It should only be used for screenshots.\n\nIt can cause severe graphical glitches when other players wear specific outfits and can cause severe performance drops.\n\nApply Photography anyway?", "Photography warning"))
-                {
-                    return;
-                }
-
-                result = _ini.Apply(
-                    _configPath,
-                    QualitySettings,
-                    NaniteCheck.IsChecked == true,
-                    RayTracingCheck.IsChecked == true,
-                    ReadOnlyCheck.IsChecked == true);
-            }
-
-            RefreshState(result);
-            LoadCurrentValuesIntoControls();
-        }
-        catch (Exception ex)
-        {
-            ShowError(ex.Message);
-        }
-    }
-
-    private void RefreshButton_Click(object sender, RoutedEventArgs e)
-    {
-        LoadCurrentValuesIntoControls();
-        RefreshState("Refreshed from disk.");
-    }
-
-    private void ChooseFileButton_Click(object sender, RoutedEventArgs e)
-    {
-        var dialog = new OpenFileDialog
-        {
-            Title = "Choose Fortnite GameUserSettings.ini",
-            Filter = "GameUserSettings.ini|GameUserSettings.ini|INI files (*.ini)|*.ini|All files (*.*)|*.*",
-            FileName = "GameUserSettings.ini"
-        };
-
-        string? folder = Path.GetDirectoryName(_configPath);
-        if (folder is not null && Directory.Exists(folder))
-        {
-            dialog.InitialDirectory = folder;
-        }
-
-        if (dialog.ShowDialog(this) == true)
-        {
-            _configPath = dialog.FileName;
+            bool Flag(string key) => _baseline.TryGetValue(IniSettingsService.Address(SettingsCatalog.MainSection, key), out var value)
+                && value.Equals("True", StringComparison.OrdinalIgnoreCase);
+            _dx12Nanite = Flag("bUseNanite");
+            _dx12RayTracing = Flag("bRayTracing");
+            NaniteCheck.IsChecked = _savedMode != RenderingMode.Performance && _dx12Nanite;
+            RayTracingCheck.IsChecked = _savedMode != RenderingMode.Performance && _dx12RayTracing;
+            ReadOnlyCheck.IsChecked = _baselineReadOnly;
+            LumenFixCheck.IsChecked = false;
+            Dx12Choice.IsChecked = _savedMode == RenderingMode.DirectX12;
+            PerformanceChoice.IsChecked = _savedMode == RenderingMode.Performance;
+            PresetBox.SelectedItem = _presets.Skip(1).FirstOrDefault(p =>
+                p.Nanite == NaniteCheck.IsChecked && p.RayTracing == RayTracingCheck.IsChecked &&
+                _settings.All(s => p.Values[s.Key] == s.Value)) ?? _presets[0];
+            PresetDescriptionText.Text = ((PresetDefinition)PresetBox.SelectedItem).Description;
+            _edited.Clear();
+            _featuresEdited = false;
             ConfigPathBox.Text = _configPath;
-            LoadCurrentValuesIntoControls();
-            RefreshState("Using selected file.");
-        }
-    }
-
-    private void OpenFolderButton_Click(object sender, RoutedEventArgs e)
-    {
-        string? folder = Path.GetDirectoryName(_configPath);
-        if (folder is null || !Directory.Exists(folder))
-        {
-            return;
-        }
-
-        Process.Start(new ProcessStartInfo("explorer.exe", folder) { UseShellExecute = true });
-    }
-
-    private void UndoButton_Click(object sender, RoutedEventArgs e)
-    {
-        try
-        {
-            string backup = _ini.RestoreLatestBackup(_configPath);
-            LoadCurrentValuesIntoControls();
-            RefreshState($"Restored backup:\n{backup}");
+            RefreshFileState();
+            _updating = false;
+            UpdateAvailability();
+            UpdatePlan();
         }
         catch (Exception ex)
         {
-            ShowError(ex.Message);
+            _updating = false;
+            ApplyButton.IsEnabled = false;
+            Notify(ex.Message, true);
         }
     }
 
-    private void PresetBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private void RefreshFileState()
     {
-        if (!_loaded || LumenFixCheck?.IsChecked == true)
+        bool exists = File.Exists(_configPath);
+        FileStatus.Text = exists ? "Config connected" : "Config not found";
+        FileStatus.Foreground = (Brush)FindResource(exists ? "SuccessBrush" : "WarningBrush");
+        SavedModeText.Text = _savedMode switch
         {
-            return;
-        }
+            RenderingMode.Performance => "Saved: Performance",
+            RenderingMode.DirectX12 => "Saved: DirectX 12",
+            _ => "Saved: other / not set"
+        };
+        ProtectionText.Text = !exists ? "No configuration file selected." : _ini.IsReadOnly(_configPath) ? "File status: read-only" : "File status: writable";
+        OpenFolderButton.IsEnabled = Directory.Exists(Path.GetDirectoryName(_configPath));
+        UnlockButton.IsEnabled = exists && _ini.IsReadOnly(_configPath);
+        var backups = _ini.FindBackups(_configPath);
+        UndoButton.IsEnabled = backups.Count > 0;
+        BackupText.Text = backups.Count == 0 ? "No backups yet." :
+            $"{backups.Count} backup(s). Latest: {File.GetLastWriteTime(backups[0]):g}";
+    }
 
-        if (PresetBox.SelectedItem is PresetDefinition preset)
+    private void UpdateAvailability()
+    {
+        bool performance = SelectedMode == RenderingMode.Performance;
+        PresetBox.IsEnabled = !IsLumen;
+        Dx12Choice.IsEnabled = PerformanceChoice.IsEnabled = !IsLumen;
+        NaniteCheck.IsEnabled = RayTracingCheck.IsEnabled = !IsLumen && !performance;
+        SearchBox.IsEnabled = !IsLumen;
+        foreach (var setting in _settings) setting.IsAvailable = !IsLumen && (!performance || !IniSettingsService.RequiresFullRenderer(setting));
+        _view.Refresh();
+        RendererHint.Text = IsLumen ? "Lumen Fix is exclusive. Rendering mode and quality changes are excluded." :
+            performance ? "Nanite, ray tracing and Lumen controls are unavailable in Performance Mode." :
+            SelectedMode is null ? "Choose a rendering mode to apply graphics changes." :
+            "Full DX12 rendering with Nanite, Lumen and ray tracing options.";
+        ApplyLabel.Text = IsLumen ? "Apply Lumen Fix" : "Apply settings";
+    }
+
+    private void UpdatePlan()
+    {
+        if (!_ready || _updating) return;
+        var plan = _ini.CreatePlan(_baseline, _settings.Where(s => _edited.Contains(s.Key)),
+            NaniteCheck.IsChecked == true, RayTracingCheck.IsChecked == true, SelectedMode, IsLumen);
+        bool changedToPerformance = SelectedMode == RenderingMode.Performance && SelectedMode != _savedMode;
+        _plan = plan.Where(c => IsLumen || c.Key is not ("bUseNanite" or "bRayTracing") || _featuresEdited || changedToPerformance).ToArray();
+        ChangesList.ItemsSource = _plan;
+        int count = _plan.Count + (ProtectionChangedOnDisk ? 1 : 0);
+        NavChangeCount.Text = count > 0 ? count.ToString() : "";
+        PendingText.Text = count == 0 ? "No pending changes" : $"{count} pending change{(count == 1 ? "" : "s")}";
+        ChangesSummary.Text = count == 0 ? "Your configuration is up to date." :
+            $"{_plan.Count} INI value(s) will change." +
+            (ProtectionChangedOnDisk ? $" File protection will be {(ReadOnlyCheck.IsChecked == true ? "enabled" : "disabled")}." : "");
+        bool rendererChanged = _plan.Any(c => c.Section == IniSettingsService.RendererSection);
+        ApplyHint.Text = rendererChanged ? "Restart Fortnite after applying." : "A backup is created before applying.";
+        DiscardButton.IsEnabled = HasChanges;
+        ApplyButton.IsEnabled = File.Exists(_configPath) && HasChanges && (SelectedMode.HasValue || IsLumen);
+        var text = new StringBuilder();
+        foreach (var group in _plan.GroupBy(x => x.Section))
         {
-            ApplyPreset(preset);
-            PresetDescriptionText.Text = preset.Description;
+            text.AppendLine(group.Key);
+            foreach (var change in group) text.AppendLine($"{change.Key}={change.After}");
+            text.AppendLine();
         }
+        PreviewBox.Text = text.Length == 0 ? "; No INI value changes." : text.ToString();
+        bool photo = _settings.All(s => s.Value == 5) && SelectedMode != RenderingMode.Performance && !IsLumen;
+        WarningText.Text = IsLumen ? "Lumen Fix cannot add missing hardware support. Visual quality and performance depend on the GPU and game version." :
+            photo ? "Photography: screenshots only. Certain outfits can cause severe visual glitches and performance drops. Upscaling recommended." :
+            "GPU warning: Cinematic values are very demanding. Use DLSS or another upscaler, especially below RTX 4090 / 5090 class.";
     }
 
-    private void LumenFixCheck_Changed(object sender, RoutedEventArgs e)
+    private void RendererChanged(object sender, RoutedEventArgs e)
     {
-        if (!_loaded)
-        {
-            return;
-        }
-
-        bool active = LumenFixCheck.IsChecked == true;
-        LumenFixStateText.Text = active ? "On" : "Off";
-        PresetBox.IsEnabled = !active;
-        NaniteCheck.IsEnabled = !active;
-        RayTracingCheck.IsEnabled = !active;
-        SettingsList.IsEnabled = !active;
-        SearchBox.IsEnabled = !active;
-        ApplyButton.Content = active ? "Apply Lumen Fix" : "Apply settings";
-
-        PresetDescriptionText.Text = active
-            ? "Lumen Fix is active and cannot mix with presets or manual quality controls."
-            : ((PresetDefinition?)PresetBox.SelectedItem)?.Description ?? string.Empty;
-
-        UpdatePreview();
+        if (!_ready || _updating) return;
+        OperationText.Visibility = Visibility.Collapsed;
+        _updating = true;
+        NaniteCheck.IsChecked = SelectedMode != RenderingMode.Performance && _dx12Nanite;
+        RayTracingCheck.IsChecked = SelectedMode != RenderingMode.Performance && _dx12RayTracing;
+        _updating = false;
+        UpdateAvailability();
+        UpdatePlan();
     }
 
-    private void FeatureToggle_Changed(object sender, RoutedEventArgs e)
+    private void PresetChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (!_loaded)
-        {
-            return;
-        }
-
-        NaniteStateText.Text = NaniteCheck.IsChecked == true ? "On" : "Off";
-        RayTracingStateText.Text = RayTracingCheck.IsChecked == true ? "On" : "Off";
-        ReadOnlyStateText.Text = ReadOnlyCheck.IsChecked == true ? "On" : "Off";
-        UpdatePreview();
-    }
-
-    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
-    {
-        _settingsView.Refresh();
-    }
-
-    private void ThemeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (_loaded)
-        {
-            ApplyTheme();
-        }
-    }
-
-    private void ApplyPreset(PresetDefinition preset)
-    {
-        foreach (var setting in QualitySettings)
+        if (!_ready || _updating || IsLumen || PresetBox.SelectedItem is not PresetDefinition preset) return;
+        PresetDescriptionText.Text = preset.Description;
+        if (preset.Values.Count == 0) return;
+        _updating = true;
+        foreach (var setting in _settings)
         {
             if (preset.Values.TryGetValue(setting.Key, out int value))
             {
                 setting.Value = value;
+                _edited.Add(setting.Key);
             }
         }
-
-        NaniteCheck.IsChecked = preset.Nanite;
-        RayTracingCheck.IsChecked = preset.RayTracing;
-        PresetDescriptionText.Text = preset.Description;
-        UpdatePreview();
+        _dx12Nanite = preset.Nanite;
+        _dx12RayTracing = preset.RayTracing;
+        NaniteCheck.IsChecked = SelectedMode != RenderingMode.Performance && preset.Nanite;
+        RayTracingCheck.IsChecked = SelectedMode != RenderingMode.Performance && preset.RayTracing;
+        _featuresEdited = true;
+        _updating = false;
+        _view.Refresh();
+        UpdatePlan();
     }
 
-    private void LoadCurrentValuesIntoControls()
+    private void FeatureChanged(object sender, RoutedEventArgs e)
     {
-        var values = _ini.ReadKnownValues(_configPath, QualitySettings);
-        foreach (var setting in QualitySettings)
+        if (!_ready || _updating) return;
+        _featuresEdited = true;
+        _dx12Nanite = NaniteCheck.IsChecked == true;
+        _dx12RayTracing = RayTracingCheck.IsChecked == true;
+        PresetBox.SelectedIndex = 0;
+        UpdatePlan();
+    }
+
+    private void ProtectionChanged(object sender, RoutedEventArgs e) => UpdatePlan();
+
+    private void LumenChanged(object sender, RoutedEventArgs e)
+    {
+        if (!_ready || _updating) return;
+        if (IsLumen && (_savedMode != RenderingMode.DirectX12 || SelectedMode != RenderingMode.DirectX12))
         {
-            if (values.TryGetValue(setting.Key, out string? raw) && int.TryParse(raw, out int value))
+            _updating = true;
+            LumenFixCheck.IsChecked = false;
+            _updating = false;
+            Notify("Apply DirectX 12 first, then enable Lumen Fix. The fix cannot be combined with a renderer change.", true);
+        }
+        UpdateAvailability();
+        UpdatePlan();
+    }
+
+    private void Navigate(object sender, RoutedEventArgs e)
+    {
+        if (!_ready || sender is not RadioButton button) return;
+        string page = button.Tag?.ToString() ?? "Graphics";
+        GraphicsPage.Visibility = page == "Graphics" ? Visibility.Visible : Visibility.Collapsed;
+        ChangesPage.Visibility = page == "Changes" ? Visibility.Visible : Visibility.Collapsed;
+        RecoveryPage.Visibility = page == "Recovery" ? Visibility.Visible : Visibility.Collapsed;
+        PageTitle.Text = page == "Recovery" ? "File & recovery" : page;
+        PageSubtitle.Text = page switch
+        {
+            "Changes" => "Review before applying",
+            "Recovery" => "Configuration, protection and backups",
+            _ => "Rendering and visual quality"
+        };
+    }
+
+    private void SearchChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!_ready) return;
+        _view.Refresh();
+        NoResultsText.Visibility = _view.IsEmpty ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void ApplyClick(object sender, RoutedEventArgs e)
+    {
+        if (!HasChanges) return;
+        try
+        {
+            if (_ini.IsFortniteRunning())
             {
-                setting.Value = Math.Clamp(value, 1, 5);
+                Notify("Close Fortnite before applying, then try again.", true);
+                return;
             }
+            if (IsLumen && _ini.ReadRenderingMode(_configPath) != RenderingMode.DirectX12)
+                throw new InvalidOperationException("Apply DirectX 12 before using Lumen Fix.");
+            bool photo = !IsLumen && SelectedMode != RenderingMode.Performance && _settings.All(s => s.Value == 5);
+            if (photo && !Confirm("Photography is for screenshots only. Certain outfits can cause severe graphical glitches and major performance drops.\n\nApply these values?", "Photography")) return;
+            bool rendererChanged = _plan.Any(c => c.Section == IniSettingsService.RendererSection);
+            string backup = _ini.ApplyChanges(_configPath, _plan, ReadOnlyCheck.IsChecked == true, _fingerprint);
+            LoadFile();
+            Notify(rendererChanged ? "Saved and backed up. Restart Fortnite to use the new renderer." : "Settings saved. Backup created.");
+            OperationText.ToolTip = backup;
         }
-
-        if (values.TryGetValue("bUseNanite", out string? nanite))
-        {
-            NaniteCheck.IsChecked = nanite.Equals("True", StringComparison.OrdinalIgnoreCase);
-        }
-
-        if (values.TryGetValue("bRayTracing", out string? rayTracing))
-        {
-            RayTracingCheck.IsChecked = rayTracing.Equals("True", StringComparison.OrdinalIgnoreCase);
-        }
-
-        NaniteStateText.Text = NaniteCheck.IsChecked == true ? "On" : "Off";
-        RayTracingStateText.Text = RayTracingCheck.IsChecked == true ? "On" : "Off";
-        ReadOnlyStateText.Text = ReadOnlyCheck.IsChecked == true ? "On" : "Off";
-        UpdatePreview();
+        catch (Exception ex) { Notify(ex.Message, true); }
     }
 
-    private void RefreshState(string message)
-    {
-        bool exists = File.Exists(_configPath);
-        bool readOnly = _ini.IsReadOnly(_configPath);
-        string? backup = _ini.FindLatestBackup(_configPath);
+    private bool CanDiscard() => !HasChanges || Confirm("Discard your pending changes?", "Unsaved changes");
 
-        StatusText.Text = exists ? "Found" : "Not found";
-        StatusText.Foreground = (Brush)FindResource(exists ? "SuccessBrush" : "WarningBrush");
-        ProtectionText.Text = exists ? (readOnly ? "Read-only enabled" : "Read-only off") : "Unavailable";
-        OpenFolderButton.IsEnabled = Directory.Exists(Path.GetDirectoryName(_configPath));
-        UndoButton.IsEnabled = backup is not null;
-        ApplyButton.IsEnabled = exists;
-        MessageText.Text = message;
-        UpdatePreview();
+    private void RefreshClick(object sender, RoutedEventArgs e)
+    {
+        if (CanDiscard()) { LoadFile(); Notify("Reloaded from file."); }
     }
 
-    private void UpdatePreview()
-    {
-        var builder = new StringBuilder();
-        if (LumenFixCheck?.IsChecked == true)
-        {
-            builder.AppendLine("; Mode: Lumen Fix");
-            builder.AppendLine(SettingsCatalog.MainSection);
-            builder.AppendLine("DesiredGlobalIlluminationQuality=3");
-            builder.AppendLine("PreNaniteGlobalIlluminationQuality=3");
-            builder.AppendLine("bRayTracing=True");
-            builder.AppendLine();
-            builder.AppendLine(SettingsCatalog.ScalabilitySection);
-            builder.AppendLine("sg.GlobalIlluminationQuality=3");
-        }
-        else
-        {
-            builder.AppendLine("; Pending settings");
-            builder.AppendLine(SettingsCatalog.MainSection);
-            builder.AppendLine($"bUseNanite={NaniteCheck?.IsChecked == true}");
-            foreach (var setting in QualitySettings.Where(x => x.Section == SettingsCatalog.MainSection))
-            {
-                builder.AppendLine($"{setting.Key}={setting.Value}");
-            }
-            builder.AppendLine($"bRayTracing={RayTracingCheck?.IsChecked == true}");
-            builder.AppendLine();
-            builder.AppendLine(SettingsCatalog.ScalabilitySection);
-            foreach (var setting in QualitySettings.Where(x => x.Section == SettingsCatalog.ScalabilitySection))
-            {
-                builder.AppendLine($"{setting.Key}={setting.Value}");
-            }
-        }
+    private void DiscardClick(object sender, RoutedEventArgs e) { LoadFile(); Notify("Pending changes discarded."); }
 
-        PreviewBox.Text = builder.ToString();
+    private void ChooseFileClick(object sender, RoutedEventArgs e)
+    {
+        if (!CanDiscard()) return;
+        var dialog = new OpenFileDialog
+        {
+            Title = "Choose Fortnite configuration",
+            Filter = "Fortnite settings|GameUserSettings.ini|INI files|*.ini",
+            FileName = "GameUserSettings.ini"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        _configPath = dialog.FileName;
+        LoadFile();
     }
 
-    private bool FilterSetting(object item)
+    private void DetectFileClick(object sender, RoutedEventArgs e)
     {
-        if (item is not QualitySetting setting)
-        {
-            return false;
-        }
+        if (!CanDiscard()) return;
+        _configPath = _ini.DefaultConfigPath;
+        LoadFile();
+        Notify(File.Exists(_configPath) ? "Fortnite configuration found." : "Launch Fortnite once or choose its configuration file.", !File.Exists(_configPath));
+    }
 
-        string query = SearchBox?.Text?.Trim() ?? string.Empty;
-        return query.Length == 0 ||
-               setting.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-               setting.Key.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-               setting.Description.Contains(query, StringComparison.OrdinalIgnoreCase);
+    private void OpenFolderClick(object sender, RoutedEventArgs e)
+    {
+        try { Process.Start(new ProcessStartInfo("explorer.exe", $"\"{Path.GetDirectoryName(_configPath)}\"") { UseShellExecute = true }); }
+        catch (Exception ex) { Notify(ex.Message, true); }
+    }
+
+    private void RestoreClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_ini.IsFortniteRunning()) { Notify("Close Fortnite before restoring a backup.", true); return; }
+            if (!Confirm("Restore the latest full backup? This replaces the current INI, discards pending changes and removes read-only protection.", "Restore backup")) return;
+            _ini.RestoreLatestBackup(_configPath);
+            LoadFile();
+            Notify("Backup restored. File is unlocked.");
+        }
+        catch (Exception ex) { Notify(ex.Message, true); }
+    }
+
+    private void UnlockClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_ini.Fingerprint(_configPath) != _fingerprint) throw new InvalidOperationException("The file changed outside the app. Reload it first.");
+            _ini.SetReadOnly(_configPath, false);
+            _baselineReadOnly = false;
+            ReadOnlyCheck.IsChecked = false;
+            RefreshFileState();
+            UpdatePlan();
+            Notify("File unlocked. Fortnite can save settings again.");
+        }
+        catch (Exception ex) { Notify(ex.Message, true); }
+    }
+
+    private void CopyPreviewClick(object sender, RoutedEventArgs e)
+    {
+        try { Clipboard.SetText(PreviewBox.Text); Notify("Pending values copied."); }
+        catch (Exception ex) { Notify(ex.Message, true); }
+    }
+
+    private void HelpClick(object sender, RoutedEventArgs e)
+    {
+        try { Process.Start(new ProcessStartInfo("https://www.epicgames.com/help/en-US/c-202300000001636/c-202300000001719/a202300000013484") { UseShellExecute = true }); }
+        catch (Exception ex) { Notify(ex.Message, true); }
+    }
+
+    private void ThemeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_ready) return;
+        ApplyTheme();
+        if (!_persistPreferences) return;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_themePath)!);
+            File.WriteAllText(_themePath, ThemeBox.SelectedIndex.ToString());
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     private void ApplyTheme()
     {
-        bool dark = ThemeBox.SelectedItem is ComboBoxItem item
-            ? item.Content?.ToString() switch
-            {
-                "Light" => false,
-                "Dark" => true,
-                _ => IsSystemDarkTheme()
-            }
-            : IsSystemDarkTheme();
-
-        SetBrush("TextPrimaryBrush", dark ? "#F8F8F8" : "#1A1A1A");
-        SetBrush("TextSecondaryBrush", dark ? "#C8CCD6" : "#4B5565");
-        SetBrush("TextMutedBrush", dark ? "#99A0AE" : "#697386");
-        bool transparency = MicaService.IsTransparencyEnabled();
-
-        SetBrush("LayerBrush", dark ? "#B52B2926" : "#D8F3F3F3");
-        SetBrush("SidebarBrush", transparency
-            ? (dark ? "#982E2C29" : "#B8F0F0F0")
-            : (dark ? "#FF272522" : "#FFF0F0F0"));
-        SetBrush("CardBrush", transparency
-            ? (dark ? "#BC42403D" : "#D8FFFFFF")
-            : (dark ? "#FF403E3B" : "#FFFFFFFF"));
-        SetBrush("CardHoverBrush", transparency
-            ? (dark ? "#CF4B4946" : "#ECF7F7F7")
-            : (dark ? "#FF4B4946" : "#FFF7F7F7"));
-        SetBrush("CardStrokeBrush", dark ? "#3CFFFFFF" : "#22000000");
-        SetBrush("ControlBrush", transparency
-            ? (dark ? "#C8413F3C" : "#E8FFFFFF")
-            : (dark ? "#FF413F3C" : "#FFFFFFFF"));
-        SetBrush("ControlHoverBrush", transparency
-            ? (dark ? "#E052504D" : "#F5FFFFFF")
-            : (dark ? "#FF52504D" : "#FFFFFFFF"));
-        SetBrush("SelectedNavBrush", dark ? "#D4474542" : "#E5E5E5");
-        SetBrush("DropDownTextBrush", dark ? "#FFFFFF" : "#111111");
-        SetBrush("ScrollThumbBrush", dark ? "#70FFFFFF" : "#65000000");
-        SetBrush("ScrollThumbHoverBrush", dark ? "#B0FFFFFF" : "#95000000");
-        SetBrush("AccentBrush", dark ? "#60CDFF" : "#0067C0");
-        SetBrush("AccentHoverBrush", dark ? "#79D6FF" : "#1975C5");
-        SetBrush("WarningBrush", dark ? "#F7C15F" : "#A76500");
-        SetBrush("SuccessBrush", dark ? "#70E5A4" : "#107C41");
-
-        MicaService.Apply(this, dark);
-    }
-
-    private void SetBrush(string key, string color)
-    {
-        Application.Current.Resources[key] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(color));
-    }
-
-    private static bool IsSystemDarkTheme()
-    {
-        try
+        if (!_ready) return;
+        var theme = ThemeBox.SelectedIndex switch { 1 => ThemeMode.Light, 2 => ThemeMode.Dark, _ => ThemeMode.System };
+        if (Application.Current.ThemeMode != theme) Application.Current.ThemeMode = theme;
+        bool dark = ThemeBox.SelectedIndex == 2 || ThemeBox.SelectedIndex == 0 && IsSystemDark();
+        void Brush(string key, string light, string night) =>
+            Application.Current.Resources[key] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(dark ? night : light));
+        Brush("TextPrimaryBrush", "#202020", "#F4F4F4");
+        Brush("TextSecondaryBrush", "#616161", "#BCBCBC");
+        Brush("CardBrush", "#BFFFFFFF", "#95333333");
+        Brush("StrokeBrush", "#18000000", "#16FFFFFF");
+        Brush("FooterBrush", "#F5F8F8F8", "#F52B2B2B");
+        Brush("SelectedBrush", "#12000000", "#15FFFFFF");
+        Brush("WarningBrush", "#815300", "#F2C779");
+        Brush("SuccessBrush", "#126D3C", "#8ADCB0");
+        if (SystemParameters.HighContrast)
         {
-            object? value = Registry.CurrentUser
-                .OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-                ?.GetValue("AppsUseLightTheme");
-            return value is int intValue && intValue == 0;
+            Application.Current.Resources["TextPrimaryBrush"] = SystemColors.WindowTextBrush;
+            Application.Current.Resources["TextSecondaryBrush"] = SystemColors.WindowTextBrush;
+            Application.Current.Resources["CardBrush"] = SystemColors.WindowBrush;
+            Application.Current.Resources["FooterBrush"] = SystemColors.WindowBrush;
+            Application.Current.Resources["StrokeBrush"] = SystemColors.WindowTextBrush;
+            Application.Current.Resources["SelectedBrush"] = SystemColors.ControlBrush;
+            Application.Current.Resources["WarningBrush"] = SystemColors.WindowTextBrush;
+            Application.Current.Resources["SuccessBrush"] = SystemColors.WindowTextBrush;
         }
-        catch
-        {
-            return true;
-        }
+        bool mica = !SystemParameters.HighContrast && MicaService.Apply(this, dark);
+        if (!mica) Background = SystemParameters.HighContrast ? SystemColors.WindowBrush :
+            new SolidColorBrush(dark ? Color.FromRgb(32, 32, 32) : Color.FromRgb(243, 243, 243));
+        if (_baseline.Count > 0) RefreshFileState();
     }
+
+    private static bool IsSystemDark()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+        return key?.GetValue("AppsUseLightTheme") is int value && value == 0;
+    }
+
+    private void OnClosing(object? sender, CancelEventArgs e) { if (!CanDiscard()) e.Cancel = true; }
 
     private bool Confirm(string message, string title) =>
         MessageBox.Show(this, message, title, MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes;
 
-    private void ShowError(string message)
+    private void Notify(string message, bool error = false)
     {
-        MessageBox.Show(this, message, "Fortnite Graphics Master Utility", MessageBoxButton.OK, MessageBoxImage.Error);
-        RefreshState(message);
+        OperationText.Text = message;
+        OperationText.Foreground = (Brush)FindResource(error ? "WarningBrush" : "SuccessBrush");
+        OperationText.Visibility = Visibility.Visible;
+        OperationText.ToolTip = message;
     }
 }

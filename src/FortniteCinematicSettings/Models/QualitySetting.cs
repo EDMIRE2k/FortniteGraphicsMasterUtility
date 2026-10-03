@@ -6,6 +6,7 @@ namespace FortniteCinematicSettings.Models;
 public sealed class QualitySetting : INotifyPropertyChanged
 {
     private int _value;
+    private bool _isAvailable = true;
 
     public QualitySetting(string key, string name, string description, string section, int value)
     {
@@ -20,6 +21,14 @@ public sealed class QualitySetting : INotifyPropertyChanged
     public string Name { get; }
     public string Description { get; }
     public string Section { get; }
+    public bool IsAvailable
+    {
+        get => _isAvailable;
+        set { if (_isAvailable == value) return; _isAvailable = value; OnPropertyChanged(); }
+    }
+    public IReadOnlyList<QualityOption> Options => Services.SettingsCatalog.QualityOptions
+        .Concat(Value is < 1 or > 5 ? new[] { new QualityOption(Value, "Current game value") } : [])
+        .OrderBy(x => x.Value).ToArray();
 
     public int Value
     {

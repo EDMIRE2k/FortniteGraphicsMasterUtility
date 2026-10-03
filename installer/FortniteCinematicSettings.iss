@@ -1,5 +1,5 @@
 #define MyAppName "Fortnite Graphics Master Utility"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "3.0.0"
 #define MyAppPublisher "Fortnite Graphics Master Utility"
 #define MyAppExeName "FortniteGraphicsMasterUtility.exe"
 
@@ -29,7 +29,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "..\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

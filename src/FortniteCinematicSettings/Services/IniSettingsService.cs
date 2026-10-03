@@ -1,264 +1,244 @@
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using FortniteCinematicSettings.Models;
 
 namespace FortniteCinematicSettings.Services;
 
+public sealed record SettingChange(string Section, string Key, string Before, string After)
+{
+    public string DisplaySection => Section.Trim('[', ']');
+}
+
 public sealed class IniSettingsService
 {
-    private static readonly Regex SectionPattern = new(@"^\s*\[.+\]\s*$", RegexOptions.Compiled);
-
+    public const string RendererSection = "[D3DRHIPreference]";
+    private static readonly Regex SectionPattern = new(@"^\s*(\[[^\]]+\])\s*(?:[;#].*)?$", RegexOptions.Compiled);
     public string DefaultConfigPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "FortniteGame",
-        "Saved",
-        "Config",
-        "WindowsClient",
-        "GameUserSettings.ini");
+        "FortniteGame", "Saved", "Config", "WindowsClient", "GameUserSettings.ini");
 
     public bool IsFortniteRunning()
     {
-        try
+        foreach (var process in Process.GetProcesses())
         {
-            return Process.GetProcesses().Any(p =>
-                p.ProcessName.Contains("Fortnite", StringComparison.OrdinalIgnoreCase));
+            using (process)
+            {
+                try
+                {
+                    if (process.ProcessName.StartsWith("FortniteClient", StringComparison.OrdinalIgnoreCase) ||
+                        process.ProcessName.Equals("FortniteGame", StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch (InvalidOperationException) { }
+            }
         }
-        catch
+        return false;
+    }
+
+    public static string Address(string section, string key) => section + "\n" + key;
+
+    public Dictionary<string, string> ReadValues(string path)
+    {
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!File.Exists(path)) return values;
+        string section = "";
+        foreach (string line in File.ReadLines(path))
         {
-            return false;
+            var match = SectionPattern.Match(line);
+            if (match.Success) { section = match.Groups[1].Value; continue; }
+            string text = line.Trim();
+            if (text.StartsWith(';') || text.StartsWith('#')) continue;
+            int equals = text.IndexOf('=');
+            if (equals > 0) values[Address(section, text[..equals].Trim())] = text[(equals + 1)..].Trim();
         }
+        return values;
     }
 
     public Dictionary<string, string> ReadKnownValues(string path, IEnumerable<QualitySetting> qualitySettings)
     {
-        if (!File.Exists(path))
-        {
-            return [];
-        }
-
-        var keys = qualitySettings.Select(x => x.Key)
-            .Concat(["bUseNanite", "bRayTracing"])
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
+        var values = ReadValues(path);
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var line in File.ReadLines(path))
-        {
-            int equalsIndex = line.IndexOf('=');
-            if (equalsIndex <= 0)
-            {
-                continue;
-            }
-
-            string key = line[..equalsIndex].Trim();
-            if (keys.Contains(key))
-            {
-                result[key] = line[(equalsIndex + 1)..].Trim();
-            }
-        }
-
+        foreach (var setting in qualitySettings)
+            if (values.TryGetValue(Address(setting.Section, setting.Key), out var value)) result[setting.Key] = value;
+        foreach (string key in new[] { "bUseNanite", "bRayTracing" })
+            if (values.TryGetValue(Address(SettingsCatalog.MainSection, key), out var value)) result[key] = value;
         return result;
     }
 
-    public string Apply(
-        string path,
-        IEnumerable<QualitySetting> qualitySettings,
-        bool nanite,
-        bool rayTracing,
-        bool readOnly)
+    public RenderingMode? ReadRenderingMode(string path)
     {
-        var bySection = new Dictionary<string, IReadOnlyDictionary<string, string>>
+        var values = ReadValues(path);
+        values.TryGetValue(Address(RendererSection, "PreferredRHI"), out var rhi);
+        values.TryGetValue(Address(RendererSection, "PreferredFeatureLevel"), out var feature);
+        if (!string.Equals(rhi, "dx12", StringComparison.OrdinalIgnoreCase)) return null;
+        return feature?.ToLowerInvariant() switch
         {
-            [SettingsCatalog.MainSection] = qualitySettings
-                .Where(x => x.Section == SettingsCatalog.MainSection)
-                .ToDictionary(x => x.Key, x => x.Value.ToString(), StringComparer.OrdinalIgnoreCase)
-                .Concat(new Dictionary<string, string>
-                {
-                    ["bUseNanite"] = nanite.ToString(),
-                    ["bRayTracing"] = rayTracing.ToString()
-                })
-                .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase),
-            [SettingsCatalog.ScalabilitySection] = qualitySettings
-                .Where(x => x.Section == SettingsCatalog.ScalabilitySection)
-                .ToDictionary(x => x.Key, x => x.Value.ToString(), StringComparer.OrdinalIgnoreCase)
+            "es31" => RenderingMode.Performance,
+            "sm6" => RenderingMode.DirectX12,
+            _ => null
         };
-
-        return ApplySections(path, bySection, readOnly, "settings");
     }
 
-    public string ApplyLumenFix(string path, bool readOnly)
-    {
-        var bySection = new Dictionary<string, IReadOnlyDictionary<string, string>>
-        {
-            [SettingsCatalog.MainSection] = new Dictionary<string, string>
-            {
-                ["DesiredGlobalIlluminationQuality"] = "3",
-                ["PreNaniteGlobalIlluminationQuality"] = "3",
-                ["bRayTracing"] = "True"
-            },
-            [SettingsCatalog.ScalabilitySection] = new Dictionary<string, string>
-            {
-                ["sg.GlobalIlluminationQuality"] = "3"
-            }
-        };
+    public static bool RequiresFullRenderer(QualitySetting setting) =>
+        setting.Section == SettingsCatalog.MainSection ||
+        setting.Key is "sg.GlobalIlluminationQuality" or "sg.ReflectionQuality";
 
-        return ApplySections(path, bySection, readOnly, "Lumen Fix");
+    public IReadOnlyList<SettingChange> CreatePlan(
+        IReadOnlyDictionary<string, string> current, IEnumerable<QualitySetting> settings,
+        bool nanite, bool rayTracing, RenderingMode? mode, bool lumenFix)
+    {
+        var changes = new List<SettingChange>();
+        void Add(string section, string key, string value)
+        {
+            string before = current.TryGetValue(Address(section, key), out var old) ? old : "(not set)";
+            if (!before.Equals(value, StringComparison.OrdinalIgnoreCase))
+                changes.Add(new(section, key, before, value));
+        }
+        if (lumenFix)
+        {
+            Add(SettingsCatalog.MainSection, "DesiredGlobalIlluminationQuality", "3");
+            Add(SettingsCatalog.MainSection, "PreNaniteGlobalIlluminationQuality", "3");
+            Add(SettingsCatalog.MainSection, "bRayTracing", "True");
+            Add(SettingsCatalog.ScalabilitySection, "sg.GlobalIlluminationQuality", "3");
+            return changes;
+        }
+        if (mode.HasValue)
+        {
+            Add(RendererSection, "PreferredRHI", "dx12");
+            Add(RendererSection, "PreferredFeatureLevel", mode == RenderingMode.Performance ? "es31" : "sm6");
+        }
+        bool performance = mode == RenderingMode.Performance;
+        foreach (var setting in settings)
+            if (!performance || !RequiresFullRenderer(setting))
+                Add(setting.Section, setting.Key, setting.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Add(SettingsCatalog.MainSection, "bUseNanite", (!performance && nanite).ToString());
+        Add(SettingsCatalog.MainSection, "bRayTracing", (!performance && rayTracing).ToString());
+        return changes;
     }
 
-    public string RestoreLatestBackup(string path)
+    public string Fingerprint(string path) => File.Exists(path)
+        ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))) : "";
+
+    public string ApplyChanges(string path, IReadOnlyList<SettingChange> changes, bool readOnly, string? expectedFingerprint = null)
     {
-        string? backup = FindLatestBackup(path);
-        if (backup is null)
-        {
-            throw new InvalidOperationException("No utility backup was found next to GameUserSettings.ini.");
-        }
-
-        if (File.Exists(path))
-        {
-            ClearReadOnly(path);
-        }
-
-        File.Copy(backup, path, true);
-        ClearReadOnly(path);
+        if (!File.Exists(path)) throw new FileNotFoundException("Choose an existing GameUserSettings.ini first.", path);
+        if (expectedFingerprint is not null && Fingerprint(path) != expectedFingerprint)
+            throw new InvalidOperationException("The file changed outside the app. Reload it before applying.");
+        byte[] original = File.ReadAllBytes(path);
+        using var reader = new StreamReader(new MemoryStream(original), Encoding.UTF8, true);
+        string text = reader.ReadToEnd();
+        Encoding encoding = reader.CurrentEncoding;
+        bool bom = encoding.GetPreamble().Length > 0 && original.AsSpan().StartsWith(encoding.GetPreamble());
+        string newline = text.Contains("\r\n") ? "\r\n" : text.Contains('\r') ? "\r" : "\n";
+        bool trailingNewline = text.EndsWith('\n') || text.EndsWith('\r');
+        var lines = Regex.Split(text, "\r\n|\n|\r").ToList();
+        if (trailingNewline) lines.RemoveAt(lines.Count - 1);
+        foreach (var group in changes.GroupBy(x => x.Section))
+            UpdateSection(lines, group.Key, group.ToDictionary(x => x.Key, x => x.After, StringComparer.OrdinalIgnoreCase));
+        string updated = string.Join(newline, lines) + (trailingNewline ? newline : "");
+        byte[] payload = encoding.GetBytes(updated);
+        if (bom) payload = [.. encoding.GetPreamble(), .. payload];
+        string backup = CreateBackup(path);
+        ReplaceContents(path, payload, readOnly);
         return backup;
     }
 
-    public string? FindLatestBackup(string path)
+    public string Apply(string path, IEnumerable<QualitySetting> settings, bool nanite, bool rayTracing, bool readOnly) =>
+        ApplyChanges(path, CreatePlan(ReadValues(path), settings, nanite, rayTracing, null, false), readOnly);
+
+    public string ApplyLumenFix(string path, bool readOnly)
+    {
+        if (ReadRenderingMode(path) != RenderingMode.DirectX12)
+            throw new InvalidOperationException("Apply DirectX 12 before using Lumen Fix.");
+        return ApplyChanges(path, CreatePlan(ReadValues(path), [], false, true, null, true), readOnly);
+    }
+
+    public IReadOnlyList<string> FindBackups(string path)
     {
         string? folder = Path.GetDirectoryName(path);
-        if (folder is null || !Directory.Exists(folder))
-        {
-            return null;
-        }
-
-        return Directory.GetFiles(folder, "GameUserSettings.fgmu-backup-*.ini")
-            .OrderByDescending(File.GetLastWriteTimeUtc)
-            .FirstOrDefault();
+        if (folder is null || !Directory.Exists(folder)) return [];
+        string stem = Path.GetFileNameWithoutExtension(path);
+        return Directory.GetFiles(folder, stem + ".fgmu-backup-*.ini")
+            .Concat(Directory.GetFiles(folder, stem + ".biomeforge-backup-*.ini"))
+            .OrderByDescending(File.GetLastWriteTimeUtc).ToArray();
     }
 
-    public bool IsReadOnly(string path) =>
-        File.Exists(path) && File.GetAttributes(path).HasFlag(FileAttributes.ReadOnly);
+    public string? FindLatestBackup(string path) => FindBackups(path).FirstOrDefault();
 
+    public string RestoreLatestBackup(string path)
+    {
+        string backup = FindLatestBackup(path) ?? throw new InvalidOperationException("No backup is available for this file.");
+        ReplaceContents(path, File.ReadAllBytes(backup), false);
+        return backup;
+    }
+
+    public bool IsReadOnly(string path) => File.Exists(path) && File.GetAttributes(path).HasFlag(FileAttributes.ReadOnly);
     public void SetReadOnly(string path, bool value)
     {
-        if (!File.Exists(path))
-        {
-            return;
-        }
-
         var attributes = File.GetAttributes(path);
-        File.SetAttributes(path, value
-            ? attributes | FileAttributes.ReadOnly
-            : attributes & ~FileAttributes.ReadOnly);
+        File.SetAttributes(path, value ? attributes | FileAttributes.ReadOnly : attributes & ~FileAttributes.ReadOnly);
     }
 
-    private string ApplySections(
-        string path,
-        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> sections,
-        bool readOnly,
-        string operationName)
+    private void ReplaceContents(string path, byte[] payload, bool readOnly)
     {
-        if (!File.Exists(path))
+        string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        bool wasReadOnly = IsReadOnly(path);
+        bool replaced = false;
+        try
         {
-            throw new FileNotFoundException("GameUserSettings.ini was not found.", path);
+            File.WriteAllBytes(temp, payload);
+            if (File.Exists(path)) { SetReadOnly(path, false); File.Replace(temp, path, null); }
+            else File.Move(temp, path);
+            replaced = true;
+            SetReadOnly(path, readOnly);
         }
-
-        ClearReadOnly(path);
-        string backup = CreateBackup(path);
-        string original = File.ReadAllText(path);
-        string newline = original.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
-        var lines = Regex.Split(original, "\r\n|\n|\r").ToList();
-
-        if (lines.Count > 0 && lines[^1].Length == 0)
+        finally
         {
-            lines.RemoveAt(lines.Count - 1);
+            if (!replaced && File.Exists(path)) SetReadOnly(path, wasReadOnly);
+            if (File.Exists(temp)) File.Delete(temp);
         }
-
-        foreach (var section in sections)
-        {
-            UpdateSection(lines, section.Key, section.Value);
-        }
-
-        File.WriteAllText(path, string.Join(newline, lines) + newline, new UTF8Encoding(false));
-        SetReadOnly(path, readOnly);
-        return $"Applied {operationName}. Backup created at:\n{backup}";
     }
 
-    private static void UpdateSection(
-        List<string> lines,
-        string sectionName,
-        IReadOnlyDictionary<string, string> values)
+    private static void UpdateSection(List<string> lines, string name, IReadOnlyDictionary<string, string> values)
     {
-        int sectionStart = lines.FindIndex(x =>
-            string.Equals(x.Trim(), sectionName, StringComparison.OrdinalIgnoreCase));
-
-        if (sectionStart < 0)
+        string current = "";
+        int insertAt = -1;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < lines.Count; i++)
         {
-            if (lines.Count > 0 && lines[^1].Length != 0)
+            var match = SectionPattern.Match(lines[i]);
+            if (match.Success) current = match.Groups[1].Value;
+            if (!current.Equals(name, StringComparison.OrdinalIgnoreCase)) continue;
+            insertAt = i + 1;
+            if (match.Success) continue;
+            int equals = lines[i].IndexOf('=');
+            if (equals < 1) continue;
+            string key = lines[i][..equals].Trim();
+            if (values.TryGetValue(key, out var value))
             {
-                lines.Add(string.Empty);
+                lines[i] = key + "=" + value;
+                seen.Add(key);
             }
-
-            lines.Add(sectionName);
-            sectionStart = lines.Count - 1;
         }
-
-        int sectionEnd = lines.FindIndex(sectionStart + 1, x => SectionPattern.IsMatch(x));
-        if (sectionEnd < 0)
+        if (insertAt < 0)
         {
-            sectionEnd = lines.Count;
+            if (lines.Count > 0 && lines[^1] != "") lines.Add("");
+            lines.Add(name);
+            insertAt = lines.Count;
         }
-
         foreach (var pair in values)
-        {
-            int existing = -1;
-            for (int i = sectionStart + 1; i < sectionEnd; i++)
-            {
-                int equalsIndex = lines[i].IndexOf('=');
-                if (equalsIndex > 0 &&
-                    string.Equals(lines[i][..equalsIndex].Trim(), pair.Key, StringComparison.OrdinalIgnoreCase))
-                {
-                    existing = i;
-                    break;
-                }
-            }
-
-            if (existing >= 0)
-            {
-                lines[existing] = $"{pair.Key}={pair.Value}";
-            }
-            else
-            {
-                lines.Insert(sectionEnd, $"{pair.Key}={pair.Value}");
-                sectionEnd++;
-            }
-        }
+            if (!seen.Contains(pair.Key)) lines.Insert(insertAt++, pair.Key + "=" + pair.Value);
     }
 
     private static string CreateBackup(string path)
     {
-        string folder = Path.GetDirectoryName(path)!;
-        string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-        string backup = Path.Combine(folder, $"GameUserSettings.fgmu-backup-{stamp}.ini");
-        int suffix = 2;
-
-        while (File.Exists(backup))
-        {
-            backup = Path.Combine(folder, $"GameUserSettings.fgmu-backup-{stamp}-{suffix}.ini");
-            suffix++;
-        }
-
-        File.Copy(path, backup);
+        string backup = Path.Combine(Path.GetDirectoryName(path)!,
+            $"{Path.GetFileNameWithoutExtension(path)}.fgmu-backup-{DateTime.UtcNow:yyyyMMdd-HHmmss-fffffff}.ini");
+        File.Copy(path, backup, false);
+        File.SetAttributes(backup, FileAttributes.Normal);
+        File.SetLastWriteTimeUtc(backup, DateTime.UtcNow);
         return backup;
-    }
-
-    private static void ClearReadOnly(string path)
-    {
-        var attributes = File.GetAttributes(path);
-        if (attributes.HasFlag(FileAttributes.ReadOnly))
-        {
-            File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
-        }
     }
 }

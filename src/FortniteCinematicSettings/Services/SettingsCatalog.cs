@@ -48,7 +48,7 @@ public static class SettingsCatalog
 
         return
         [
-            new("Low", "Lowest supported quality values for maximum performance.", false, false, Uniform(1)),
+            new("Low", "Quality tier 1 across the available settings.", false, false, Uniform(1)),
             new("Medium", "Balanced low-to-mid quality values.", false, false, Uniform(2)),
             new("High", "High quality with Lumen tier 3 values.", true, true, Uniform(3)),
             new("Epic", "Epic quality across every exposed setting.", true, true, Uniform(4)),
