@@ -2,10 +2,8 @@
 
 A native Windows app for configuring Fortnite's graphics, switching rendering modes, and managing backups of `GameUserSettings.ini`.
 
-[Installer](Releases/FortniteGraphicsMasterUtility-SETUP.exe) | [Standalone app](Releases/FortniteGraphicsMasterUtility-STANDALONE.exe)
+<img width="1536" height="1169" alt="image" src="https://github.com/user-attachments/assets/8cf81685-b67d-4f16-a224-6d9494ce1707" />
 
-![Graphics view](<img width="1536" height="1169" alt="image" src="https://github.com/user-attachments/assets/e31de0a4-952c-4dcb-ab88-1c79f2df69c9" />
-)
 
 ## What's new in version 3
 
