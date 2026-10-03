@@ -4,7 +4,8 @@ A native Windows app for configuring Fortnite's graphics, switching rendering mo
 
 [Installer](Releases/FortniteGraphicsMasterUtility-SETUP.exe) | [Standalone app](Releases/FortniteGraphicsMasterUtility-STANDALONE.exe)
 
-![Graphics view](Screenshots/app-preview.png)
+![Graphics view](<img width="1536" height="1169" alt="image" src="https://github.com/user-attachments/assets/e31de0a4-952c-4dcb-ab88-1c79f2df69c9" />
+)
 
 ## What's new in version 3
 
